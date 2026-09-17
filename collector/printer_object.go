@@ -26,7 +26,6 @@ type PrinterObjectStatus struct {
 	PauseResume        PrinterObjectPauseResume        `json:"pause_resume"`
 	GcodeMove          PrinterObjectGcodeMove          `json:"gcode_move"`
 	Toolhead           PrinterObjectToolhead           `json:"toolhead"`
-	Extruder           PrinterObjectExtruder           `json:"extruder"`
 	HeaterBed          PrinterObjectHeaterBed          `json:"heater_bed"`
 	Fan                PrinterObjectFan                `json:"fan"`
 	IdleTimeout        PrinterObjectIdleTimeout        `json:"idle_timeout"`
@@ -47,6 +46,7 @@ type PrinterObjectStatus struct {
 	FilamentSensors    map[string]PrinterObjectFilamentSensor
 	GenericHeaters     map[string]PrinterObjectHeater
 	TmcSensors         map[string]PrinterObjectTmc
+	Extruders          map[string]PrinterObjectExtruder
 }
 
 type PrinterObjectMcu struct {
@@ -100,7 +100,6 @@ type PrinterObjectExtruder struct {
 	SmoothTime      float64 `json:"smooth_time"`
 }
 
-const extruderQuery string = "extruder"
 
 type PrinterObjectHeaterBed struct {
 	Temperature float64 `json:"temperature"`
@@ -260,7 +259,13 @@ func (f *PrinterObjectStatus) UnmarshalJSON(bs []byte) (err error) {
 		filamentSensors := make(map[string]PrinterObjectFilamentSensor)
 		genericHeaters := make(map[string]PrinterObjectHeater)
 		tmcSensors := make(map[string]PrinterObjectTmc)
+		extruders := make(map[string]PrinterObjectExtruder)
 		for k, v := range m {
+			if extruderRegex.MatchString(k) {
+				value := PrinterObjectExtruder{}
+				mapstructure.Decode(v, &value)
+				extruders[k] = value
+			}
 			// find mcus
 			mcuMatch := mcuRegex.FindStringSubmatch(k)
 			if mcuMatch != nil {
@@ -329,6 +334,7 @@ func (f *PrinterObjectStatus) UnmarshalJSON(bs []byte) (err error) {
 		f.FilamentSensors = filamentSensors
 		f.GenericHeaters = genericHeaters
 		f.TmcSensors = tmcSensors
+		f.Extruders = extruders
 	}
 	return err
 }
@@ -342,6 +348,7 @@ type PrinterObjectsList struct {
 var (
 	filamentSensorRegex      *regexp.Regexp = regexp.MustCompile("^filament_(switch|motion)_sensor ")
 	mcuRegex                 *regexp.Regexp = regexp.MustCompile("^mcu(?P<label> [a-zA-Z0-9_]+)?")
+	extruderRegex            *regexp.Regexp = regexp.MustCompile(`^extruder\d*$`)
 	customSensorsMu          sync.Mutex
 	customMicrocontrollers   map[string][]string   = make(map[string][]string)
 	customTemperatureSensors map[string][]string   = make(map[string][]string)
@@ -354,16 +361,17 @@ var (
 	customFilamentSensors    map[string][][]string = make(map[string][][]string)
 	customGenericHeaters     map[string][]string   = make(map[string][]string)
 	customTmcSensors         map[string][]string   = make(map[string][]string)
+	customExtruders          map[string][]string   = make(map[string][]string)
 )
 
 // fetchCustomSensors queries klipper for the complete list and printer objects and
 // returns the subset of `temperature_sensor`, `temperature_fan`, `output_pin`,
 // `fan_generic`, `controller_fan`, and `filament_*_sensor` objects that have custom names.
-func (c Collector) fetchCustomSensors() (*[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[][]string, *[]string, *[]string, error) {
+func (c Collector) fetchCustomSensors() (*[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[]string, *[][]string, *[]string, *[]string, *[]string, error) {
 	var response PrinterObjectsList
 	if err := c.fetchFromMoonraker("/printer/objects/list", &response); err != nil {
 		log.Error(err)
-		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 	}
 
 	microcontrollers := []string{}
@@ -377,7 +385,12 @@ func (c Collector) fetchCustomSensors() (*[]string, *[]string, *[]string, *[]str
 	filamentSensors := [][]string{}
 	genericHeaters := []string{}
 	tmcSensors := []string{}
+	extruders := []string{}
 	for o := range response.Result.Objects {
+		// find extruders (extruder, extruder1, ...)
+		if extruderRegex.MatchString(response.Result.Objects[o]) {
+			extruders = append(extruders, response.Result.Objects[o])
+		}
 		// find mcus
 		mcuMatch := mcuRegex.FindStringSubmatch(response.Result.Objects[o])
 		if mcuMatch != nil {
@@ -436,7 +449,7 @@ func (c Collector) fetchCustomSensors() (*[]string, *[]string, *[]string, *[]str
 		}
 	}
 
-	return &microcontrollers, &temperatureSensors, &temperatureFans, &temperatureProbes, &outputPins, &genericFans, &controllerFans, &heaterFans, &filamentSensors, &genericHeaters, &tmcSensors, nil
+	return &microcontrollers, &temperatureSensors, &temperatureFans, &temperatureProbes, &outputPins, &genericFans, &controllerFans, &heaterFans, &filamentSensors, &genericHeaters, &tmcSensors, &extruders, nil
 }
 
 func (c Collector) fetchMoonrakerPrinterObjects() (*PrinterObjectResponse, error) {
@@ -450,12 +463,12 @@ func (c Collector) fetchMoonrakerPrinterObjects() (*PrinterObjectResponse, error
 	customSensorsMu.Unlock()
 
 	if !ok {
-		mcus, ts, tf, tp, op, gf, cf, hf, fs, gh, tmc, err := c.fetchCustomSensors()
+		mcus, ts, tf, tp, op, gf, cf, hf, fs, gh, tmc, ex, err := c.fetchCustomSensors()
 		if err != nil {
 			log.Error(err)
 			return nil, err
 		}
-		log.Infof("Found custom sensors: %+v %+v %+v %+v %+v %+v %+v %+v %+v %+v", mcus, ts, tf, tp, op, gf, cf, hf, fs, gh)
+		log.Infof("Found custom sensors: %+v %+v %+v %+v %+v %+v %+v %+v %+v %+v %+v", mcus, ts, tf, tp, op, gf, cf, hf, fs, gh, ex)
 
 		customSensorsMu.Lock()
 		if _, ok := customTemperatureSensors[c.target]; !ok {
@@ -470,6 +483,7 @@ func (c Collector) fetchMoonrakerPrinterObjects() (*PrinterObjectResponse, error
 			customFilamentSensors[c.target] = *fs
 			customGenericHeaters[c.target] = *gh
 			customTmcSensors[c.target] = *tmc
+			customExtruders[c.target] = *ex
 		}
 		customSensorsMu.Unlock()
 	}
@@ -481,6 +495,14 @@ func (c Collector) fetchMoonrakerPrinterObjects() (*PrinterObjectResponse, error
 		} else {
 			mcuQuery += "&mcu%20" + customMicrocontrollers[c.target][mcu] + "=last_stats"
 		}
+	}
+
+	extruderQuery := ""
+	for ex := range customExtruders[c.target] {
+		extruderQuery += "&" + customExtruders[c.target][ex]
+	}
+	if extruderQuery == "" {
+		extruderQuery = "&extruder"
 	}
 
 	customSensorsQuery := ""
@@ -518,7 +540,7 @@ func (c Collector) fetchMoonrakerPrinterObjects() (*PrinterObjectResponse, error
 	urlPath := "/printer/objects/query" +
 		"?" + gcodeMoveQuery +
 		"&" + toolheadQuery +
-		"&" + extruderQuery +
+		extruderQuery +
 		"&" + heaterBedQuery +
 		"&" + fanQuery +
 		"&" + idleTimeoutQuery +
@@ -708,12 +730,21 @@ func (c Collector) collectPrinterObjects(ch chan<- prometheus.Metric) {
 	}
 	c.emitCounter(ch, "klipper_toolhead_stalls_total", "Total number of toolhead stalls.", result.Result.Status.Toolhead.Stalls)
 
-	// extruder
-	c.emitGauge(ch, "klipper_extruder_temperature", "Klipper extruder temperature.", result.Result.Status.Extruder.Temperature)
-	c.emitGauge(ch, "klipper_extruder_target", "Klipper extruder target.", result.Result.Status.Extruder.Target)
-	c.emitGauge(ch, "klipper_extruder_power", "Klipper extruder power.", result.Result.Status.Extruder.Power)
-	c.emitGauge(ch, "klipper_extruder_pressure_advance", "Klipper extruder pressure advance.", result.Result.Status.Extruder.PressureAdvance)
-	c.emitGauge(ch, "klipper_extruder_smooth_time", "Klipper extruder smooth time.", result.Result.Status.Extruder.SmoothTime)
+	// extruder(s) — dynamic; one series per extruder with an `extruder` label
+	extruderLabels := []string{"extruder"}
+	extruderTempDesc := prometheus.NewDesc("klipper_extruder_temperature", "Klipper extruder temperature.", extruderLabels, nil)
+	extruderTargetDesc := prometheus.NewDesc("klipper_extruder_target", "Klipper extruder target.", extruderLabels, nil)
+	extruderPowerDesc := prometheus.NewDesc("klipper_extruder_power", "Klipper extruder power.", extruderLabels, nil)
+	extruderPADesc := prometheus.NewDesc("klipper_extruder_pressure_advance", "Klipper extruder pressure advance.", extruderLabels, nil)
+	extruderSmoothDesc := prometheus.NewDesc("klipper_extruder_smooth_time", "Klipper extruder smooth time.", extruderLabels, nil)
+	for name, ex := range result.Result.Status.Extruders {
+		exName := GetValidLabelName(name)
+		ch <- prometheus.MustNewConstMetric(extruderTempDesc, prometheus.GaugeValue, ex.Temperature, exName)
+		ch <- prometheus.MustNewConstMetric(extruderTargetDesc, prometheus.GaugeValue, ex.Target, exName)
+		ch <- prometheus.MustNewConstMetric(extruderPowerDesc, prometheus.GaugeValue, ex.Power, exName)
+		ch <- prometheus.MustNewConstMetric(extruderPADesc, prometheus.GaugeValue, ex.PressureAdvance, exName)
+		ch <- prometheus.MustNewConstMetric(extruderSmoothDesc, prometheus.GaugeValue, ex.SmoothTime, exName)
+	}
 
 	// heater_bed
 	c.emitGauge(ch, "klipper_heater_bed_temperature", "Klipper heater bed temperature.", result.Result.Status.HeaterBed.Temperature)
